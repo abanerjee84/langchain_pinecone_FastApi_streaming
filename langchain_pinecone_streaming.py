@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from langchain.chat_models import ChatOpenAI
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.chains import RetrievalQA
+from langchain.vectorstores import Pinecone
+from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.chains import LLMChain, ConversationChain, ConversationalRetrievalChain
 from langchain.chains.conversation.memory import (ConversationBufferMemory,
                                                   ConversationSummaryMemory,
@@ -48,6 +50,9 @@ embed = OpenAIEmbeddings(
 index = pinecone.Index(YOUR_INDEX_NAME)
 text_field = "text"
 
+### clear all vectors from pinecone index
+# index.delete(delete_all=True)
+
 vectorstore = Pinecone(
     index, embed.embed_query, text_field
 )
@@ -59,6 +64,36 @@ llm = ChatOpenAI(
     temperature=0.0
 )
 
+# Get a list of all the files in ./documents
+files = os.listdir('./documents')
+
+# Loop over the files
+for file in files:
+    # Read the file in chunks and store them in a list
+    chunks = []
+    with open('./documents/' + file) as f:
+        chunk_id = 0
+        while True:
+            chunk = f.read(500) # Read 500 characters at a time
+            if not chunk:
+                break
+            # Add the chunk ID and text to the list
+            chunks.append((chunk_id, chunk))
+            chunk_id += 1
+
+    # Batch insert the chunks into the vector store
+    batch_size = 3 # Define your preferred batch size
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        metadatas = [{'title': file,'text': chunk[1]} for chunk in batch]
+        documents = [chunk for chunk_id, chunk in batch]
+        embeds = embed.embed_documents(documents)
+        ids = [str(chunk_id) for chunk_id, chunk in batch]
+        index.upsert(vectors=zip(ids, embeds, metadatas))
+        
+    # # Flush the vector store to ensure all documents are inserted
+    # vectorstore.flush()
+    
 # conversational memory
 conversational_memory = ConversationBufferWindowMemory(
     memory_key='chat_history',
@@ -104,16 +139,64 @@ agent = initialize_agent(
 
 app = FastAPI()
 
+# Dictionary to store chat IDs and their corresponding agents
+chat_agents_dict = {}
+
+
 class Query(BaseModel):
+    chat_id: str
     query: str
 
 @app.post("/ask")
 async def ask(query: Query):
+    # If chat_id is not in memory, create a new agent for it
+    if query.chat_id not in chat_agents_dict:
+        conversational_memory = ConversationBufferWindowMemory(
+            memory_key='chat_history',
+            k=8,
+            return_messages=True
+        )
+
+        chat_agents_dict[query.chat_id] = initialize_agent(
+            agent='chat-conversational-react-description',
+            tools=tools,
+            llm=llm,
+            verbose=False,
+            max_iterations=3,
+            early_stopping_method='generate',
+            memory=conversational_memory
+        )
+
+    # Retrieve the correct agent for the chat_id
+    agent = chat_agents_dict[query.chat_id]
+
+    # Run the agent
     response = agent(query.query)
     output = response.get('output')
+    
+    ## get the relevant text 
+    res = vectorstore.similarity_search(
+        query=query.query,
+        k=3  # return 3 most relevant docs
+    )
+    embedded_query = embed.embed_query(query.query)
+    res2 = index.query(queries=[embedded_query], top_k=3)
+    print(res2)
 
     def iter_output():
+        out = ""
         for line in output.splitlines():
-            yield line + "\n"
+            out += line + "\n"
+        page_contents = [res[0].page_content, res[1].page_content, res[2].page_content]
+        meta_datas = [res[0].metadata, res[1].metadata, res[2].metadata]
+        combined_text = [page_contents, meta_datas]
+        
+        ## crteate a readable text
+        relevant_section = "\nRelevant Sections:\n"
+        for i in range(0, len(combined_text)):
+            relevant_section += str(i+1) + ". " + combined_text[0][i] + " :from:  " + combined_text[1][i]['title'] + "\n"
+        out += relevant_section
+        yield out
+            
 
     return StreamingResponse(iter_output(), media_type="text/plain")
