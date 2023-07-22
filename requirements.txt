@@ -3,3 +3,5 @@ langchain==0.0.235
 pinecone_client==2.2.2
 pydantic==1.10.10
 python-dotenv==1.0.0
+tqdm
+pandas
